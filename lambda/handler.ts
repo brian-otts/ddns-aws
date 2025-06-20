@@ -139,9 +139,14 @@ export const handler: Handler<
 
     return respond(200, 'No update needed');
 
-  } catch (err) {
+  } catch (err: Error | unknown) {
     logger.error('Unhandled error', { err });
-    await alert('DDNS Fatal Error', JSON.stringify(err));
+    if (err instanceof Error) {
+      await alert('DDNS Fatal Error', `${err.name}: ${err.message}\n${err.stack}`);
+    } else {
+      await alert('DDNS Fatal Error', `Non-error thrown: ${JSON.stringify(err)}`);
+    }
+    
     return respond(500, 'Internal Server Error');
   }
 };

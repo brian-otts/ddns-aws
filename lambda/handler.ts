@@ -6,255 +6,203 @@ import {
 import { Logger } from '@aws-lambda-powertools/logger';
 import {
   DynamoDBClient,
-  PutItemCommand,
   QueryCommand,
-  UpdateItemCommand
+  PutItemCommand,
+  UpdateItemCommand,
 } from '@aws-sdk/client-dynamodb';
 import {
   Route53Client,
   ListResourceRecordSetsCommand,
-  ChangeResourceRecordSetsCommand
+  ChangeResourceRecordSetsCommand,
 } from '@aws-sdk/client-route-53';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 
 const logger = new Logger();
 
 const ddb = new DynamoDBClient({});
 const r53 = new Route53Client({});
-const sns = new SNSClient({});
+const sns = new SNSClient();
 
-const DDNS_TABLE_NAME = process.env.DDNS_TABLE_NAME!;
-const IP_COUNT_TABLE = process.env.IP_COUNT_TABLE!;
-const TOPIC_ARN = process.env.TOPIC_ARN!;
-const HOSTED_ZONE_ID = process.env.HOSTED_ZONE_ID!;
+const {
+  DDNS_TABLE_NAME,
+  IP_COUNT_TABLE,
+  TOPIC_ARN,
+  HOSTED_ZONE_ID,
+  ALLOWED_TIMESTAMP_DRIFT = '300',
+} = process.env;
+
+const THIRTY_DAYS_SEC = 60 * 60 * 24 * 30;
+const THIRTY_MIN_SEC = 60 * 30;
+const ALLOWED_SKEW = parseInt(ALLOWED_TIMESTAMP_DRIFT);
 
 interface RequestBody {
   hostname: string;
-  validationHash: string;
+  timestamp: string;
+  validationHmac: string;
 }
 
-export const handler: Handler<APIGatewayProxyEventV2, APIGatewayProxyResultV2> = async (
-  event: APIGatewayProxyEventV2
-): Promise<APIGatewayProxyResultV2> => {
-  const THIRTY_DAYS = 60 * 60 * 24 * 30; // 30 days in seconds
-
-  // Extract source IP, attach to logger context for all logs
+export const handler: Handler<
+  APIGatewayProxyEventV2,
+  APIGatewayProxyResultV2
+> = async (event) => {
   const sourceIp = event.requestContext?.http?.sourceIp || 'unknown';
   logger.appendKeys({ sourceIp });
 
-  // Enforce POST method
   if (event.requestContext.http.method !== 'POST') {
-    logger.error('Invalid HTTP method', {
-      method: event.requestContext.http.method,
-    });
-    return { statusCode: 405, body: 'Method Not Allowed' };
+    return respond(405, 'Method Not Allowed');
   }
 
-  // Validate payload
   let body: RequestBody;
   try {
     body = JSON.parse(event.body || '');
   } catch {
-    logger.error('Invalid JSON payload');
-    return { statusCode: 400, body: 'Invalid JSON' };
+    return respond(400, 'Invalid JSON');
   }
 
-  const { hostname, validationHash } = body;
-  if (!hostname || !validationHash) {
-    logger.error('Missing required fields', { body });
-    return { statusCode: 400, body: 'Missing hostname or validationHash' };
+  const { hostname, timestamp, validationHmac } = body;
+  if (!hostname || !timestamp || !validationHmac) {
+    return respond(400, 'Missing fields');
   }
 
   try {
-    // Query for the latest record by hostname
-    const queryResult = await ddb.send(new QueryCommand({
-      TableName: DDNS_TABLE_NAME,
-      KeyConditionExpression: "hostname = :hostname",
-      ExpressionAttributeValues: {
-        ":hostname": { S: hostname },
-      },
-      ScanIndexForward: false, // newest first
+    // Load secret for this hostname
+    const query = await ddb.send(new QueryCommand({
+      TableName: DDNS_TABLE_NAME!,
+      KeyConditionExpression: "hostname = :h",
+      ExpressionAttributeValues: { ":h": { S: hostname } },
+      ScanIndexForward: false,  // get latest entry for hostname
       Limit: 1,
     }));
-
-    const latest = queryResult.Items?.[0];
-    if (!latest) {
-      logger.error('Hostname not found in DDB', { hostname });
-      return { statusCode: 404, body: 'Hostname not found' };
-    }
+    const latest = query.Items?.[0];
+    if (!latest) return respond(404, 'Hostname not found');
 
     const secret = latest.sharedSecret.S!;
-    const lastIp = latest.ipAddress?.S;   
+    const dnsTtl = parseInt(latest.ttl.N!, 600);
 
-    // Verify hash
-    const expectedHash = crypto.createHash('sha256')
-      .update(`${sourceIp}|${hostname}|${secret}`)
-      .digest('hex');
-
-    if (expectedHash !== validationHash) {
-      logger.error('Invalid validation hash', {
-        expectedHash,
-        received: validationHash,
-      });
-
-      await sns.send(new PublishCommand({
-        TopicArn: TOPIC_ARN,
-        Subject: `DDNS Authorization Error: Invalid Hash for ${hostname}`,
-        Message: `Received hash: ${validationHash}\nExpected hash: ${expectedHash}\nSource IP: ${sourceIp}`,
-      }));
-
-      return { statusCode: 403, body: 'Invalid validation hash' };
+    // Validate timestamp & HMAC
+    const nowEpoch = Math.floor(Date.now() / 1000);
+    const tsEpoch = Math.floor(new Date(timestamp).getTime() / 1000);
+    if (Math.abs(nowEpoch - tsEpoch) > ALLOWED_SKEW) {
+      return respond(400, 'Invalid timestamp');
     }
 
-    // Query Route 53 for current record
+    const expectedHmac = crypto.createHmac('sha256', secret)
+      .update(`${hostname}|${timestamp}`)
+      .digest('hex');
+
+    if (!safeEqual(expectedHmac, validationHmac)) {
+      logger.error('Invalid HMAC');
+      await alert(`Auth Error for ${hostname}`, `Bad HMAC from IP: ${sourceIp}`);
+      return respond(403, 'Invalid HMAC');
+    }
+
+    // Get current A record
     const r53Resp = await r53.send(new ListResourceRecordSetsCommand({
-      HostedZoneId: HOSTED_ZONE_ID,
+      HostedZoneId: HOSTED_ZONE_ID!,
       StartRecordName: hostname,
       StartRecordType: 'A',
       MaxItems: 1,
     }));
-
     const currentR53Ip = r53Resp.ResourceRecordSets?.[0]?.ResourceRecords?.[0]?.Value;
-    logger.info('Route 53 A record fetched', {
-      currentR53Ip,
-      lastIp,
-    });
+    const lastIp = latest.ipAddress?.S;
 
-    // Detect drift & alert if needed
+    // Drift check
     if (currentR53Ip && lastIp && currentR53Ip !== lastIp) {
-      logger.warn('Drift detected between Route 53 and DynamoDB', {
-        route53: currentR53Ip,
-        ddb: lastIp,
-      });
-
-      await sns.send(new PublishCommand({
-        TopicArn: TOPIC_ARN,
-        Subject: `DDNS Drift Alert: ${hostname}`,
-        Message: `Route 53 IP: ${currentR53Ip}\nDynamoDB IP: ${lastIp}`,
-      }));
-
-      await ddb.send(new PutItemCommand({
-        TableName: DDNS_TABLE_NAME,
-        Item: {
-          hostname: { S: hostname },
-          timestamp: { S: new Date().toISOString() },
-          ipAddress: { S: currentR53Ip },
-          sharedSecret: { S: secret },
-          ttl: { N: (Math.floor(Date.now() / 1000) + THIRTY_DAYS).toString() },
-        },
-      }));
+      logger.warn('Drift detected', { route53: currentR53Ip, ddb: lastIp });
+      await alert(`Drift Alert: ${hostname}`, `Route53: ${currentR53Ip}\nDDB: ${lastIp}`);
+      await saveIp(hostname, currentR53Ip, secret);
     }
 
-    // If Route 53 differs from *current* client IP, update it
+    // If IP differs, update
     if (currentR53Ip !== sourceIp) {
-      logger.info('Updating Route 53 record', {
-        old: currentR53Ip,
-        new: sourceIp,
-      });
-
-      await r53.send(new ChangeResourceRecordSetsCommand({
-        HostedZoneId: HOSTED_ZONE_ID,
-        ChangeBatch: {
-          Changes: [{
-            Action: 'UPSERT',
-            ResourceRecordSet: {
-              Name: hostname,
-              Type: 'A',
-              TTL: 600,
-              ResourceRecords: [{ Value: sourceIp }],
-            },
-          }],
-        },
-      }));
-  
-
-      // Store new time series record with TTL
-      const now = new Date();
-      const nowIso = now.toISOString();
-      const ttlSeconds = Math.floor(now.getTime() / 1000) + THIRTY_DAYS; // expire in 30 days
-
-      await ddb.send(new PutItemCommand({
-        TableName: DDNS_TABLE_NAME,
-        Item: {
-          hostname: { S: hostname },
-          timestamp: { S: nowIso },
-          ipAddress: { S: sourceIp },
-          sharedSecret: { S: secret },
-          ttl: { N: ttlSeconds.toString() },
-        },
-      }));
-
-      // Atomically increment IP usage counter
-      await ddb.send(new UpdateItemCommand({
-        TableName: IP_COUNT_TABLE,
-        Key: { ipAddress: { S: sourceIp } },
-        UpdateExpression: "ADD #c :incr",
-        ExpressionAttributeNames: { "#c": "count" },
-        ExpressionAttributeValues: { ":incr": { N: "1" } },
-      }));
-
-      logger.info('DDNS update completed successfully');
-
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'Updated OK' }),
-      };
-     } 
-     
-    // No Update needed, check and update TTL if necessary
-    const ttl = parseInt(latest.ttl?.N!);
-    
-    // Store new time series record with TTL
-    const now = new Date();
-    const nowEpochTime = Math.floor(now.getTime() / 1000);
-    const THIRTY_MINS = 60 * 30; // expire in 30 minutes
-
-    // If TTL is within 30 minutes, extend it
-    if (ttl - nowEpochTime <= THIRTY_MINS) {
-      const newTtl = nowEpochTime + THIRTY_DAYS; // expire in 30 days
-      
-      await ddb.send(new UpdateItemCommand({
-        TableName: DDNS_TABLE_NAME,
-        Key: { hostname: { S: hostname }, timestamp: { S: latest.timestamp.S! } },
-        UpdateExpression: "SET ttl = :newttl",
-        ExpressionAttributeValues: {
-          ":newttl": { N: newTtl.toString() },
-        },
-      }));
-      
-
-      logger.info('TTL extended for existing DDB record; Route 53 already matches client IP', {
-        currentR53Ip,
-        hostname,
-      });
-    
-      return {
-        statusCode: 200,
-        body: JSON.stringify({ message: 'No update required, but DDB TTL extended' }),
-      };
+      await updateRoute53(hostname, sourceIp, dnsTtl);
+      await saveIp(hostname, sourceIp, secret);
+      await incrementIpCount(sourceIp);
+      return respond(200, 'Updated OK');
     }
 
-    logger.info('No update needed', {
-      currentR53Ip,
-      lastIp,
-      hostname,
-    });
+    // Otherwise, extend TTL if nearly expired
+    const ttl = parseInt(latest.ttl?.N!);
+    if (ttl - nowEpoch <= THIRTY_MIN_SEC) {
+      await extendTtl(hostname, latest.timestamp.S!, nowEpoch + THIRTY_DAYS_SEC);
+      return respond(200, 'No update, TTL extended');
+    }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({ message: 'No update required' }),
-    };
-  } catch (error) {
-    logger.error('Unhandled error', { error });
-    await sns.send(new PublishCommand({
-      TopicArn: TOPIC_ARN,
-      Subject: `DDNS Fatal Error`,
-      Message: `Error: ${JSON.stringify(error)}`,
-    }));
-    return {
-      statusCode: 500,
-      body: 'Internal Server Error',
-    };
+    return respond(200, 'No update needed');
+
+  } catch (err) {
+    logger.error('Unhandled error', { err });
+    await alert('DDNS Fatal Error', JSON.stringify(err));
+    return respond(500, 'Internal Server Error');
   }
 };
+
+function respond(code: number, msg: string): APIGatewayProxyResultV2 {
+  return { statusCode: code, body: JSON.stringify({ message: msg }) };
+}
+
+function safeEqual(a: string, b: string) {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+}
+
+async function alert(subject: string, msg: string) {
+  await sns.send(new PublishCommand({
+    TopicArn: TOPIC_ARN!,
+    Subject: subject,
+    Message: msg,
+  }));
+}
+
+async function updateRoute53(name: string, ip: string, ttl: number = 600) {
+  await r53.send(new ChangeResourceRecordSetsCommand({
+    HostedZoneId: HOSTED_ZONE_ID!,
+    ChangeBatch: {
+      Changes: [{
+        Action: 'UPSERT',
+        ResourceRecordSet: {
+          Name: name,
+          Type: 'A',
+          TTL: ttl,
+          ResourceRecords: [{ Value: ip }],
+        },
+      }],
+    },
+  }));
+}
+
+async function saveIp(hostname: string, ip: string, secret: string) {
+  const now = new Date();
+  const ttl = Math.floor(now.getTime() / 1000) + THIRTY_DAYS_SEC;
+  await ddb.send(new PutItemCommand({
+    TableName: DDNS_TABLE_NAME!,
+    Item: {
+      hostname: { S: hostname },
+      timestamp: { S: now.toISOString() },
+      ipAddress: { S: ip },
+      sharedSecret: { S: secret },
+      ttl: { N: ttl.toString() },
+    },
+  }));
+}
+
+async function incrementIpCount(ip: string) {
+  await ddb.send(new UpdateItemCommand({
+    TableName: IP_COUNT_TABLE!,
+    Key: { ipAddress: { S: ip } },
+    UpdateExpression: "ADD #c :incr",
+    ExpressionAttributeNames: { "#c": "count" },
+    ExpressionAttributeValues: { ":incr": { N: "1" } },
+  }));
+}
+
+async function extendTtl(hostname: string, timestamp: string, newTtl: number) {
+  await ddb.send(new UpdateItemCommand({
+    TableName: DDNS_TABLE_NAME!,
+    Key: { hostname: { S: hostname }, timestamp: { S: timestamp } },
+    UpdateExpression: "SET ttl = :ttl",
+    ExpressionAttributeValues: { ":ttl": { N: newTtl.toString() } },
+  }));
+}

@@ -21,19 +21,19 @@ export class StatelessStack extends Stack {
     super(scope, id, props);
 
     const fn = new NodejsFunction(this, 'DDNSFunction', {
-      runtime: Runtime.NODEJS_LATEST,
+      runtime: Runtime.NODEJS_22_X,
       entry: path.join(__dirname, '../../lambda/handler.ts'),
       environment: {
         DDNS_TABLE_NAME: props.table.tableName,
         IP_COUNT_TABLE: props.ipCountTable.tableName,
         TOPIC_ARN: props.topic.topicArn,
         HOSTED_ZONE_ID: props.hostedZone.hostedZoneId,
+        ALLOWED_TIMESTAMP_DRIFT: '300', // 5 minutes
         POWERTOOLS_SERVICE_NAME: 'DDNSFunction',
         POWERTOOLS_LOG_LEVEL: 'INFO',
         POWERTOOLS_LOGGER_LOG_EVENT: 'true',  // Only works if you inject context in the handler
       },
       logRetention: RetentionDays.ONE_MONTH,
-      // reservedConcurrentExecutions: 1
     });
 
     props.table.grantReadWriteData(fn);

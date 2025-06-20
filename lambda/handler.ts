@@ -37,6 +37,7 @@ const THIRTY_MIN_SEC = 60 * 30;
 const ALLOWED_SKEW = parseInt(ALLOWED_TIMESTAMP_DRIFT);
 
 interface RequestBody {
+  ipAddress: string;
   hostname: string;
   timestamp: string;
   validationHmac: string;
@@ -60,9 +61,16 @@ export const handler: Handler<
     return respond(400, 'Invalid JSON');
   }
 
-  const { hostname, timestamp, validationHmac } = body;
-  if (!hostname || !timestamp || !validationHmac) {
+  const { ipAddress, hostname, timestamp, validationHmac } = body;
+  if (!ipAddress || !hostname || !timestamp || !validationHmac) {
     return respond(400, 'Missing fields');
+  }
+
+  if (sourceIp !== ipAddress) {
+    const suspiciousActivityPrefix = 'Suspicious Activity';
+    logger.warn(`${suspiciousActivityPrefix} - Source IP does not match provided IP`, { ipAddress });
+    await alert(`${suspiciousActivityPrefix} - IP Mismatch for ${hostname}`, `Source IP: ${sourceIp}\nProvided IP: ${ipAddress}`);
+    return respond(403, 'Source IP does not match provided IP');
   }
 
   try {
@@ -78,7 +86,7 @@ export const handler: Handler<
     if (!latest) return respond(404, 'Hostname not found');
 
     const secret = latest.sharedSecret.S!;
-    const dnsRecordTtl = latest.dnsRecordTtl.N ? parseInt(latest.dnsRecordTtl.N) : 600;
+    const dnsRecordTtl = latest.dnsRecordTtl?.N ? parseInt(latest.dnsRecordTtl.N) : 600;
 
     // Validate timestamp & HMAC
     const nowEpoch = Math.floor(Date.now() / 1000);
@@ -88,7 +96,7 @@ export const handler: Handler<
     }
 
     const expectedHmac = crypto.createHmac('sha256', secret)
-      .update(`${hostname}|${timestamp}`)
+      .update(`${ipAddress}|${hostname}|${timestamp}`)
       .digest('hex');
 
     if (!safeEqual(expectedHmac, validationHmac)) {

@@ -78,7 +78,7 @@ export const handler: Handler<
     if (!latest) return respond(404, 'Hostname not found');
 
     const secret = latest.sharedSecret.S!;
-    const dnsTtl = parseInt(latest.ttl.N!, 600);
+    const dnsRecordTtl = latest.dnsRecordTtl.N ? parseInt(latest.dnsRecordTtl.N) : 600;
 
     // Validate timestamp & HMAC
     const nowEpoch = Math.floor(Date.now() / 1000);
@@ -116,13 +116,13 @@ export const handler: Handler<
 
     // If IP differs, update
     if (currentR53Ip !== sourceIp) {
-      await updateRoute53(hostname, sourceIp, dnsTtl);
+      await updateRoute53(hostname, sourceIp, dnsRecordTtl);
       await saveIp(hostname, sourceIp, secret);
       await incrementIpCount(sourceIp);
       return respond(200, 'Updated OK');
     }
 
-    // Otherwise, extend TTL if nearly expired
+    // Otherwise, extend DDB record's TTL if nearly expired
     const ttl = parseInt(latest.ttl?.N!);
     if (ttl - nowEpoch <= THIRTY_MIN_SEC) {
       await extendTtl(hostname, latest.timestamp.S!, nowEpoch + THIRTY_DAYS_SEC);

@@ -17,6 +17,7 @@ import {
 } from '@aws-sdk/client-route-53';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import crypto from 'node:crypto';
+import { log } from 'node:console';
 
 const logger = new Logger();
 
@@ -152,6 +153,7 @@ export const handler: Handler<
 };
 
 function respond(code: number, msg: string): APIGatewayProxyResultV2 {
+  logger.info('Response', { code, msg });
   return { statusCode: code, body: JSON.stringify({ message: msg }) };
 }
 
@@ -162,14 +164,17 @@ function safeEqual(a: string, b: string) {
 }
 
 async function alert(subject: string, msg: string) {
+  logger.warn('Alerting via SNS', { subject, msg });
   await sns.send(new PublishCommand({
     TopicArn: TOPIC_ARN!,
     Subject: subject,
     Message: msg,
   }));
+  logger.info('Alert sent', { subject });
 }
 
 async function updateRoute53(name: string, ip: string, ttl: number = 600) {
+  logger.debug('Updating Route53 record', { name, ttl });
   await r53.send(new ChangeResourceRecordSetsCommand({
     HostedZoneId: HOSTED_ZONE_ID!,
     ChangeBatch: {
@@ -184,11 +189,13 @@ async function updateRoute53(name: string, ip: string, ttl: number = 600) {
       }],
     },
   }));
+  logger.info('Route53 record updated', { name, ttl });
 }
 
 async function saveIp(hostname: string, ip: string, secret: string) {
   const now = new Date();
   const ttl = Math.floor(now.getTime() / 1000) + THIRTY_DAYS_SEC;
+  logger.debug('Saving new IP to DDB', { hostname, ttl });
   await ddb.send(new PutItemCommand({
     TableName: DDNS_TABLE_NAME!,
     Item: {
@@ -199,9 +206,11 @@ async function saveIp(hostname: string, ip: string, secret: string) {
       ttl: { N: ttl.toString() },
     },
   }));
+  logger.info('New IP saved to DDB', { hostname, ttl });
 }
 
 async function incrementIpCount(ip: string) {
+  logger.debug('Incrementing IP count');
   await ddb.send(new UpdateItemCommand({
     TableName: IP_COUNT_TABLE!,
     Key: { ipAddress: { S: ip } },
@@ -209,13 +218,16 @@ async function incrementIpCount(ip: string) {
     ExpressionAttributeNames: { "#c": "count" },
     ExpressionAttributeValues: { ":incr": { N: "1" } },
   }));
+  logger.info('IP count incremented');
 }
 
 async function extendTtl(hostname: string, timestamp: string, newTtl: number) {
+  logger.debug('Extending TTL for hostname', { hostname, timestamp, newTtl });
   await ddb.send(new UpdateItemCommand({
     TableName: DDNS_TABLE_NAME!,
     Key: { hostname: { S: hostname }, timestamp: { S: timestamp } },
     UpdateExpression: "SET ttl = :ttl",
     ExpressionAttributeValues: { ":ttl": { N: newTtl.toString() } },
   }));
+  logger.info('TTL extended for hostname', { hostname, newTtl });
 }

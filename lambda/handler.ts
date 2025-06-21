@@ -160,7 +160,7 @@ export const handler: Handler<
 };
 
 function respond(code: number, msg: string): APIGatewayProxyResultV2 {
-  logger.info('Response', { code, msg });
+  logger.info('Response', { response: { code, msg } });
   return { statusCode: code, body: JSON.stringify({ message: msg }) };
 }
 

@@ -50,6 +50,13 @@ export const handler: Handler<
 > = async (event) => {
   const sourceIp = event.requestContext?.http?.sourceIp || 'unknown';
   logger.appendKeys({ sourceIp });
+  
+  logger.debug('Received request', {
+    method: event.requestContext.http.method,
+    body: event.body,
+    headers: event.headers,
+  });
+
 
   if (event.requestContext.http.method !== 'POST') {
     return respond(405, 'Method Not Allowed');
@@ -101,7 +108,7 @@ export const handler: Handler<
       .digest('hex');
 
     if (!safeEqual(expectedHmac, validationHmac)) {
-      logger.error('Invalid HMAC');
+      logger.critical('Invalid HMAC');
       await alert(`Auth Error for ${hostname}`, `Bad HMAC from IP: ${sourceIp}`);
       return respond(403, 'Invalid HMAC');
     }

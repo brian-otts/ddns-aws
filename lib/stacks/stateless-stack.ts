@@ -28,10 +28,10 @@ export class StatelessStack extends Stack {
         IP_COUNT_TABLE: props.ipCountTable.tableName,
         TOPIC_ARN: props.topic.topicArn,
         HOSTED_ZONE_ID: props.hostedZone.hostedZoneId,
-        ALLOWED_TIMESTAMP_DRIFT: '300', // 5 minutes
+        ALLOWED_TIMESTAMP_DRIFT: '300',  // 5 minutes in seconds
         POWERTOOLS_SERVICE_NAME: 'DDNSFunction',
         POWERTOOLS_LOG_LEVEL: 'INFO',
-        POWERTOOLS_LOGGER_LOG_EVENT: 'true',  // Only works if you inject context in the handler
+        POWERTOOLS_LOGGER_LOG_EVENT: 'true',  // Only works if you inject context or call specific logEventIfEnabled fn in the handler
       },
       logRetention: RetentionDays.ONE_MONTH,
     });

@@ -18,7 +18,6 @@ if (!notificationEmail || !domainName) {
 
 const stateful = new StatefulStack(app, 'StatefulStack', {
   env,
-  notificationEmail,
   domainName,
 });
 
@@ -26,6 +25,6 @@ new StatelessStack(app, 'StatelessStack', {
   env,
   table: stateful.table,
   ipCountTable: stateful.ipCountTable,
-  topic: stateful.topic,
+  notificationEmail,
   hostedZone: stateful.hostedZone,
 });

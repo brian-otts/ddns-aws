@@ -1,19 +1,15 @@
 import { RemovalPolicy, Stack, StackProps } from 'aws-cdk-lib';
 import { Table, AttributeType, BillingMode } from 'aws-cdk-lib/aws-dynamodb';
-import { Topic } from 'aws-cdk-lib/aws-sns';
-import { EmailSubscription } from 'aws-cdk-lib/aws-sns-subscriptions';
 import { HostedZone, IHostedZone } from 'aws-cdk-lib/aws-route53';
 import { Construct } from 'constructs';
 
 interface StatefulStackProps extends StackProps {
-  notificationEmail: string;
   domainName: string;
 }
 
 export class StatefulStack extends Stack {
   readonly table: Table;
   readonly ipCountTable: Table;
-  readonly topic: Topic;
   readonly hostedZone: IHostedZone;
 
   constructor(scope: Construct, id: string, props: StatefulStackProps) {
@@ -38,8 +34,5 @@ export class StatefulStack extends Stack {
       billingMode: BillingMode.PAY_PER_REQUEST,
       removalPolicy: RemovalPolicy.DESTROY
     });
-
-    this.topic = new Topic(this, 'AlertTopic');
-    this.topic.addSubscription(new EmailSubscription(props.notificationEmail));
   }
 }

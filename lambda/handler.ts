@@ -33,8 +33,8 @@ const {
   ALLOWED_TIMESTAMP_DRIFT = "300",
 } = process.env;
 
-const THIRTY_DAYS_IN_MILLISECONDS = 60 * 60 * 24 * 30 * 1000;
-const THIRTY_MINUTES_IN_MILLISECONDS = 60 * 30 * 1000;
+const THIRTY_DAYS_IN_SECONDS = 60 * 60 * 24 * 30;
+const THIRTY_MINUTES_IN_SECONDS = 60 * 30;
 const ALLOWED_SKEW = parseInt(ALLOWED_TIMESTAMP_DRIFT);
 
 interface RequestBody {
@@ -159,11 +159,11 @@ export const handler: Handler<
 
     // Otherwise, extend DDB record's TTL if nearly expired
     const ttl = parseInt(latest.ttl?.N!);
-    if (ttl - nowEpoch <= THIRTY_MINUTES_IN_MILLISECONDS) {
+    if (ttl - nowEpoch <= THIRTY_MINUTES_IN_SECONDS) {
       await extendTtl(
         hostname,
         latest.timestamp.S!,
-        nowEpoch + THIRTY_DAYS_IN_MILLISECONDS
+        nowEpoch + THIRTY_DAYS_IN_SECONDS
       );
       return respond(200, "No update, TTL extended");
     }
@@ -235,7 +235,7 @@ async function updateRoute53(name: string, ip: string, ttl: number = 600) {
 
 async function saveIp(hostname: string, ip: string, secret: string) {
   const now = new Date();
-  const ttl = Math.floor(now.getTime() / 1000) + THIRTY_DAYS_IN_MILLISECONDS;
+  const ttl = Math.floor(now.getTime() / 1000) + THIRTY_DAYS_IN_SECONDS;
   logger.debug("Saving new IP to DDB", { hostname, ttl });
   await ddb.send(
     new PutItemCommand({
@@ -271,9 +271,17 @@ async function extendTtl(hostname: string, timestamp: string, newTtl: number) {
   await ddb.send(
     new UpdateItemCommand({
       TableName: DDNS_TABLE_NAME!,
-      Key: { hostname: { S: hostname }, timestamp: { S: timestamp } },
-      UpdateExpression: "SET ttl = :ttl",
-      ExpressionAttributeValues: { ":ttl": { N: newTtl.toString() } },
+      Key: {
+        hostname: { S: hostname },
+        timestamp: { S: timestamp },
+      },
+      UpdateExpression: "SET #ttl = :ttl",
+      ExpressionAttributeNames: {
+        "#ttl": "ttl",
+      },
+      ExpressionAttributeValues: {
+        ":ttl": { N: newTtl.toString() },
+      },
     })
   );
   logger.info("TTL extended for hostname", { hostname, newTtl });
